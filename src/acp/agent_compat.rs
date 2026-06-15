@@ -131,6 +131,7 @@ pub enum StartupError {
         installed: String,
         required: String,
         install_command: String,
+        auto_install: bool,
     },
     /// Adapter passed name/version checks but reported a protocol version
     /// aoe does not speak.
@@ -140,6 +141,7 @@ pub enum StartupError {
     MissingAgentInfo {
         expected_package: String,
         install_command: String,
+        auto_install: bool,
     },
     /// Adapter advertised a different package name than aoe expected for
     /// this `ExpectedAgent`. Probably a wrapper or stale install.
@@ -147,6 +149,7 @@ pub enum StartupError {
         expected: String,
         received: String,
         install_command: String,
+        auto_install: bool,
     },
     /// `agent_info.version` was present but did not parse as semver.
     UnparseableAgentVersion {
@@ -154,6 +157,7 @@ pub enum StartupError {
         raw_version: String,
         required: String,
         install_command: String,
+        auto_install: bool,
     },
 }
 
@@ -181,12 +185,14 @@ impl StartupError {
                 installed,
                 required,
                 install_command,
+                ..
             } => format!(
                 "{package_name} {installed} installed; aoe requires >={required}. Run: {install_command}",
             ),
             Self::MissingAgentInfo {
                 expected_package,
                 install_command,
+                ..
             } => format!(
                 "Adapter did not report its package version. aoe requires {expected_package} >=0.44.0. Run: {install_command}",
             ),
@@ -194,6 +200,7 @@ impl StartupError {
                 expected,
                 received,
                 install_command,
+                ..
             } => format!(
                 "Adapter reported package name `{received}` but aoe expected `{expected}`. Run: {install_command}",
             ),
@@ -202,6 +209,7 @@ impl StartupError {
                 raw_version,
                 required,
                 install_command,
+                ..
             } => format!(
                 "{package_name} reported version `{raw_version}` which is not valid semver. aoe requires >={required}. Run: {install_command}",
             ),
@@ -220,38 +228,46 @@ impl From<&StartupError> for StartupErrorDetail {
                 installed,
                 required,
                 install_command,
+                auto_install,
             } => StartupErrorDetail::IncompatibleAgentVersion {
                 package_name: package_name.clone(),
                 installed: installed.clone(),
                 required: required.clone(),
                 install_command: install_command.clone(),
+                auto_install: *auto_install,
             },
             StartupError::MissingAgentInfo {
                 expected_package,
                 install_command,
+                auto_install,
             } => StartupErrorDetail::MissingAgentInfo {
                 expected_package: expected_package.clone(),
                 install_command: install_command.clone(),
+                auto_install: *auto_install,
             },
             StartupError::MismatchedAgentName {
                 expected,
                 received,
                 install_command,
+                auto_install,
             } => StartupErrorDetail::MismatchedAgentName {
                 expected: expected.clone(),
                 received: received.clone(),
                 install_command: install_command.clone(),
+                auto_install: *auto_install,
             },
             StartupError::UnparseableAgentVersion {
                 package_name,
                 raw_version,
                 required,
                 install_command,
+                auto_install,
             } => StartupErrorDetail::UnparseableAgentVersion {
                 package_name: package_name.clone(),
                 raw_version: raw_version.clone(),
                 required: required.clone(),
                 install_command: install_command.clone(),
+                auto_install: *auto_install,
             },
             StartupError::UnsupportedProtocolVersion { expected, received } => {
                 StartupErrorDetail::UnsupportedProtocolVersion {
@@ -284,12 +300,14 @@ pub fn validate(expected: ExpectedAgent, init: &InitializeResponse) -> Result<()
 
     let install_command =
         install_command_for(expected).unwrap_or_else(|| "(see project docs)".to_string());
+    let auto_install = auto_install_for(expected);
 
     let Some(info) = init.agent_info.as_ref() else {
         if policy.fail_on_missing_agent_info {
             return Err(StartupError::MissingAgentInfo {
                 expected_package: policy.expected_name.unwrap_or("(unspecified)").to_string(),
                 install_command,
+                auto_install,
             });
         }
         return Ok(());
@@ -301,6 +319,7 @@ pub fn validate(expected: ExpectedAgent, init: &InitializeResponse) -> Result<()
                 expected: expected_name.to_string(),
                 received: info.name.clone(),
                 install_command,
+                auto_install,
             });
         }
     }
@@ -315,6 +334,7 @@ pub fn validate(expected: ExpectedAgent, init: &InitializeResponse) -> Result<()
                         .unwrap_or(info.name.as_str())
                         .to_string(),
                     install_command,
+                    auto_install,
                 });
             }
             return Ok(());
@@ -327,6 +347,7 @@ pub fn validate(expected: ExpectedAgent, init: &InitializeResponse) -> Result<()
                     raw_version: raw.to_string(),
                     required: min.to_string(),
                     install_command,
+                    auto_install,
                 });
             }
         };
@@ -336,6 +357,7 @@ pub fn validate(expected: ExpectedAgent, init: &InitializeResponse) -> Result<()
                 installed: parsed.to_string(),
                 required: min.to_string(),
                 install_command,
+                auto_install,
             });
         }
     }
@@ -343,20 +365,34 @@ pub fn validate(expected: ExpectedAgent, init: &InitializeResponse) -> Result<()
     Ok(())
 }
 
+/// The ACP binary name aoe expects for this agent, or `None` for agents
+/// with no fixed binary (`AoeAgent`, `Other`).
+fn binary_for(expected: ExpectedAgent) -> Option<&'static str> {
+    Some(match expected {
+        ExpectedAgent::ClaudeAgentAcp => "claude-agent-acp",
+        ExpectedAgent::CodexAcp => "codex-acp",
+        ExpectedAgent::OpenCode => "opencode",
+        ExpectedAgent::Gemini => "gemini",
+        ExpectedAgent::PiAcp => "pi-acp",
+        ExpectedAgent::AoeAgent | ExpectedAgent::Other => return None,
+    })
+}
+
 /// Lookup table for the install commands surfaced in startup errors.
 /// Kept in sync with `install_hints::install_hint_for` so the error UI
 /// shows the exact command the doctor would run.
 fn install_command_for(expected: ExpectedAgent) -> Option<String> {
-    let bin = match expected {
-        ExpectedAgent::ClaudeAgentAcp => "claude-agent-acp",
-        ExpectedAgent::CodexAcp => "codex-acp",
-        ExpectedAgent::OpenCode => "opencode",
-        ExpectedAgent::AoeAgent => return None,
-        ExpectedAgent::Gemini => "gemini",
-        ExpectedAgent::PiAcp => "pi-acp",
-        ExpectedAgent::Other => return None,
-    };
+    let bin = binary_for(expected)?;
     crate::acp::install_hints::install_hint_for(bin).map(|s| s.to_string())
+}
+
+/// Whether the web "Update & restart" action can install this agent itself
+/// via a plain `npm install -g`. Server-authoritative pre-gate for the
+/// button; non-npm agents fall back to the displayed manual hint. See #2109.
+fn auto_install_for(expected: ExpectedAgent) -> bool {
+    binary_for(expected)
+        .and_then(crate::acp::install_hints::npm_package_for)
+        .is_some()
 }
 
 #[cfg(test)]
@@ -380,6 +416,7 @@ mod tests {
         let StartupError::IncompatibleAgentVersion {
             installed,
             required,
+            auto_install,
             ..
         } = err
         else {
@@ -387,6 +424,21 @@ mod tests {
         };
         assert_eq!(installed, "0.32.0");
         assert_eq!(required, "0.44.0");
+        // claude-agent-acp is npm-installable, so the web can offer
+        // "Update & restart". See #2109.
+        assert!(auto_install);
+    }
+
+    #[test]
+    fn auto_install_only_for_npm_agents() {
+        assert!(auto_install_for(ExpectedAgent::ClaudeAgentAcp));
+        assert!(auto_install_for(ExpectedAgent::CodexAcp));
+        assert!(auto_install_for(ExpectedAgent::Gemini));
+        // Manual-install agents fall back to the displayed hint.
+        assert!(!auto_install_for(ExpectedAgent::OpenCode));
+        assert!(!auto_install_for(ExpectedAgent::PiAcp));
+        assert!(!auto_install_for(ExpectedAgent::AoeAgent));
+        assert!(!auto_install_for(ExpectedAgent::Other));
     }
 
     #[test]
